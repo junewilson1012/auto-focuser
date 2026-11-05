@@ -7,6 +7,7 @@ from typing import Sequence
 import numpy as np
 import sep
 from astropy.modeling import fitting, models
+from scipy.ndimage import map_coordinates
 
 
 MAX_STAR_SHIFT_PX = 32
@@ -23,6 +24,16 @@ _KRON_MIN_SCALE = 3.5
 
 _BOX_PADDING_PX = 2
 _MIN_DYNAMIC_BOX = 9
+
+# Frames whose Gaussian fit explains less than this share of the box variance
+# are left out of the focus parabola.
+MIN_R_SQUARED = 0.7
+
+# The donut check fits a quartic between the outermost pixels of a cross-section
+# that reach this fraction of its peak.
+_DONUT_WINDOW_FRACTION = 0.2
+# Cuts at 0, 45, 90 and 135 degrees through the centre of the star's outline.
+_DONUT_CUT_ANGLES = tuple(np.deg2rad(a) for a in (0.0, 45.0, 90.0, 135.0))
 
 
 class MeasureError(Exception):
@@ -42,6 +53,17 @@ class StarMeasurement:
     box_origin_x: int
     box_origin_y: int
     box_size: int
+    donut: bool = False
+    r_squared: float = float("nan")
+
+    @property
+    def usable(self) -> bool:
+        """True when the frame can go into the focus parabola."""
+        return (
+            not self.donut
+            and np.isfinite(self.r_squared)
+            and self.r_squared >= MIN_R_SQUARED
+        )
 
 
 @dataclass(frozen=True)
@@ -72,7 +94,27 @@ def measure_star(
         side = _dynamic_box_side(signal, star, segmap)
 
     origin_x, origin_y, cut = _cut_box(signal, x, y, side)
+    if _has_donut(cut):
+        nan = float("nan")
+        return StarMeasurement(
+            x=x,
+            y=y,
+            sigma=nan,
+            sigma_x=nan,
+            sigma_y=nan,
+            amplitude=nan,
+            gauss_x=nan,
+            gauss_y=nan,
+            box_origin_x=origin_x,
+            box_origin_y=origin_y,
+            box_size=side,
+            donut=True,
+        )
+
     sigma_x, sigma_y, amplitude, gauss_x, gauss_y = _fit_gaussian(cut, side)
+    r_squared = _gaussian_r_squared(
+        cut, amplitude, gauss_x, gauss_y, sigma_x, sigma_y
+    )
     return StarMeasurement(
         x=x,
         y=y,
@@ -85,6 +127,7 @@ def measure_star(
         box_origin_x=origin_x,
         box_origin_y=origin_y,
         box_size=side,
+        r_squared=r_squared,
     )
 
 
@@ -355,6 +398,103 @@ def _fit_gaussian(
     ):
         raise MeasureError("No star in the measurement box.")
     return sigma_x, sigma_y, amplitude, gauss_x, gauss_y
+
+
+def _has_donut(cut: np.ndarray) -> bool:
+    """Fit a 4th degree polynomial to cuts through the star at several angles.
+
+    A focused star gives an inverted bowl, which a quartic draws as a W: one
+    maximum in the middle and a minimum on each flank. Those flank minima are
+    normal. A donut has a dip in the middle, which the quartic draws as an M:
+    a local minimum with a local maximum on each side. Only that counts, and
+    one cut showing it is enough.
+
+    The cuts go through the centre of the star's outline, not its
+    brightness-weighted centre. A lopsided donut with a bright knot on one side
+    pulls the weighted centre onto the knot, and cuts through the knot miss the
+    dark middle.
+    """
+    center_x, center_y = _outline_center(cut)
+    return any(
+        _profile_has_donut(_line_profile(cut, center_x, center_y, angle))
+        for angle in _DONUT_CUT_ANGLES
+    )
+
+
+def _outline_center(cut: np.ndarray) -> tuple[float, float]:
+    """Unweighted mean position of the pixels that reach the window fraction."""
+    peak = float(np.max(cut))
+    ys, xs = np.nonzero(cut >= _DONUT_WINDOW_FRACTION * peak)
+    if xs.size == 0:
+        half = (cut.shape[0] - 1) / 2.0
+        return half, half
+    return float(np.mean(xs)), float(np.mean(ys))
+
+
+def _line_profile(
+    cut: np.ndarray,
+    center_x: float,
+    center_y: float,
+    angle: float,
+) -> np.ndarray:
+    """Sample the box along a line through the centre, one pixel per step."""
+    side = cut.shape[0]
+    steps = np.arange(-side, side + 1, dtype=float)
+    xs = center_x + steps * np.cos(angle)
+    ys = center_y + steps * np.sin(angle)
+    inside = (xs >= 0) & (xs <= side - 1) & (ys >= 0) & (ys <= side - 1)
+    return map_coordinates(
+        np.asarray(cut, dtype=float), [ys[inside], xs[inside]], order=1
+    )
+
+
+def _profile_has_donut(profile: np.ndarray) -> bool:
+    values = np.asarray(profile, dtype=float)
+    if values.size < 5 or not np.all(np.isfinite(values)):
+        return False
+    # Fit only across the star, not the flat background the box also holds,
+    # or a small ring blurs into one broad hump.
+    bright = np.flatnonzero(values >= _DONUT_WINDOW_FRACTION * float(np.max(values)))
+    if bright.size == 0:
+        return False
+    low = max(int(bright[0]) - 1, 0)
+    high = min(int(bright[-1]) + 1, values.size - 1)
+    values = values[low : high + 1]
+    if values.size < 5:
+        return False
+    # Scale positions to [-1, 1] so the quartic fit is well conditioned.
+    u = np.linspace(-1.0, 1.0, values.size)
+    coeffs = np.polyfit(u, values, 4)
+    slope = np.polyder(coeffs)
+    curvature = np.polyder(slope)
+    roots = np.roots(slope)
+    roots = np.sort(roots[np.abs(roots.imag) < 1e-9].real)
+    roots = roots[(roots > -1.0) & (roots < 1.0)]
+    kinds = ["min" if np.polyval(curvature, r) > 0 else "max" for r in roots]
+    for index, kind in enumerate(kinds):
+        if kind == "min" and "max" in kinds[:index] and "max" in kinds[index + 1 :]:
+            return True
+    return False
+
+
+def _gaussian_r_squared(
+    cut: np.ndarray,
+    amplitude: float,
+    gauss_x: float,
+    gauss_y: float,
+    sigma_x: float,
+    sigma_y: float,
+) -> float:
+    side = cut.shape[0]
+    yy, xx = np.mgrid[0:side, 0:side]
+    model = amplitude * np.exp(
+        -0.5 * (((xx - gauss_x) / sigma_x) ** 2 + ((yy - gauss_y) / sigma_y) ** 2)
+    )
+    data = np.asarray(cut, dtype=float)
+    total = float(np.sum((data - float(np.mean(data))) ** 2))
+    if total <= 0:
+        return float("nan")
+    return 1.0 - float(np.sum((data - model) ** 2)) / total
 
 
 def _curve_samples(

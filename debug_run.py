@@ -17,7 +17,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from autofocuser.measure import _extract, measure_star, recommend_focus
+from autofocuser.measure import MIN_R_SQUARED, _extract, measure_star, recommend_focus
 
 
 def save_detection(folder: Path, frame: dict, measured) -> None:
@@ -301,15 +301,30 @@ def run_folder(source: Path) -> None:
         measured = measure_star(frame["image"], previous)
         previous = (measured.x, measured.y)
         frame["sigma"] = measured.sigma
-        signal, _sources, _segmap = _extract(frame["image"])
+        frame["usable"] = measured.usable
         save_detection(detection, frame, measured)
+        if measured.donut:
+            print(
+                f"{frame['path'].name} focus={frame['focus']} "
+                f"DONUTS: no Gaussian fit; left out of the parabola."
+            )
+            continue
+        signal, _sources, _segmap = _extract(frame["image"])
         save_gaussian(gaussian, frame, measured)
         save_cross_section(cross_section, frame, measured, signal)
+        note = "" if measured.usable else (
+            f" R^2 below {MIN_R_SQUARED}; left out of the parabola."
+        )
         print(
             f"{frame['path'].name} focus={frame['focus']} "
-            f"sigma={measured.sigma:.3f} box={measured.box_size}"
+            f"sigma={measured.sigma:.3f} r2={measured.r_squared:.3f} "
+            f"box={measured.box_size}{note}"
         )
-    save_parabola(parabola, frames)
+    usable = [frame for frame in frames if frame["usable"]]
+    if not usable:
+        print("No frames left for the parabola fit.")
+        return
+    save_parabola(parabola, usable)
 
 
 def main() -> None:

@@ -27,7 +27,7 @@ class FrameResult:
 @dataclass(frozen=True)
 class SweepResult:
     frames: list[FrameResult]
-    recommendation: FocusRecommendation
+    recommendation: FocusRecommendation | None
 
 
 def collect_fits(arguments: Sequence[str]) -> list[Path]:
@@ -67,10 +67,13 @@ def run_fits(
         previous = (measured.x, measured.y)
         frames.append(FrameResult(path=path, focus=focus, measurement=measured))
 
-    recommendation = recommend_focus(
-        [frame.focus for frame in frames],
-        [frame.measurement.sigma for frame in frames],
-    )
+    usable = [frame for frame in frames if frame.measurement.usable]
+    recommendation = None
+    if usable:
+        recommendation = recommend_focus(
+            [frame.focus for frame in usable],
+            [frame.measurement.sigma for frame in usable],
+        )
     return SweepResult(frames=frames, recommendation=recommendation)
 
 

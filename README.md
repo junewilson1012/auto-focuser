@@ -10,7 +10,9 @@ Background is subtracted, then the brightest star in the frame is found. The sam
 
 The measurement box is a square sized to that star. Its radius is a Kron aperture: the first moment of the light inside 6 detection radii, multiplied by 2.5, and never smaller than 3.5 detection radii. For a Gaussian that holds more than 99% of the light. Two pixels of padding are added past the aperture. Other detected objects are left out of the size, so a neighbor does not grow the box. Pass `--box-size` to force one square side for every frame.
 
-Inside the box, a 2D Gaussian is fit with the rotation fixed at zero.
+Inside the box, four cuts through the star (at 0°, 45°, 90° and 135°) are each fit with a 4th degree polynomial, using only the stretch between the outermost pixels that reach 20% of that cut's peak. The cuts cross at the centre of the star's outline: the unweighted mean position of the pixels above 20% of the box peak. A brightness-weighted centre would be pulled onto the bright knot of a lopsided donut, and the cuts would miss its dark middle. If any fit has a local minimum with a local maximum on each side (a dip in the middle of the star), the frame is reported as donuts and left out of the parabola. The minima a quartic draws on the flanks of an ordinary star do not count.
+
+Otherwise a 2D Gaussian is fit with the rotation fixed at zero. Its R² over the whole box is reported. Frames with R² below 0.7 are left out of the parabola.
 
 \[
 G(x,y) = A \exp\left(-\frac{1}{2}\left[\left(\frac{x-x_0}{\sigma_x}\right)^2 + \left(\frac{y-y_0}{\sigma_y}\right)^2\right]\right)
